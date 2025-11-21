@@ -1,0 +1,275 @@
+import machine
+import time
+import ujson
+import network
+import socket
+from machine import Pin, SoftI2C
+
+# Konfigurasi WiFi
+WIFI_SSID = "Hotspot-SMK"
+WIFI_PASSWORD = ""
+
+# Konfigurasi Server PyCharm
+SERVER_IP = "192.168.110.69"  # IP komputer PyCharm
+SERVER_PORT = 8000
+
+# Konfigurasi Button untuk ganti kelompok
+BUTTON_PIN = 4  # GPIO4 untuk button (bisa diganti)
+
+class WiFiConnector:
+    def __init__(self):
+        self.wlan = network.WLAN(network.STA_IF)
+        self.connected = False
+        
+    def connect(self):
+        if not self.wlan.isconnected():
+            print('📡 Menghubungkan ke WiFi...')
+            self.wlan.active(True)
+            self.wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            
+            timeout = 0
+            while not self.wlan.isconnected():
+                time.sleep(1)
+                timeout += 1
+                print(f'⏳ Menunggu koneksi... {timeout}s')
+                if timeout > 20:
+                    print('❌ Gagal connect WiFi')
+                    return False
+            
+        print('✅ WiFi Connected!')
+        print('📶 Network config:', self.wlan.ifconfig())
+        self.connected = True
+        return True
+
+class HealthSensor:
+    def __init__(self):
+        self.led = Pin(2, Pin.OUT)
+        
+    def read_sensor(self):
+        # Simulasi data sensor dengan deteksi jari
+        if time.ticks_ms() % 10 < 7:  # 70% terdeteksi
+            heart_rate = 70 + int(time.time() * 2) % 30
+            spo2 = 95 + int(time.time()) % 4
+            return heart_rate, spo2, True
+        else:
+            return 0, 0, False
+
+class ButtonHandler:
+    def __init__(self, pin=BUTTON_PIN):
+        self.button = Pin(pin, Pin.IN, Pin.PULL_UP)
+        self.last_press = 0
+        self.debounce_time = 500  # ms
+        
+    def is_pressed(self):
+        current_time = time.ticks_ms()
+        # Button pressed (LOW ketika ditekan)
+        if self.button.value() == 0:
+            if time.ticks_diff(current_time, self.last_press) > self.debounce_time:
+                self.last_press = current_time
+                return True
+        return False
+
+class HTTPClient:
+    def __init__(self, server_ip, server_port):
+        self.server_ip = server_ip
+        self.server_port = server_port
+        
+    def send_post_request(self, endpoint, data_dict):
+        try:
+            # Buat socket connection
+            addr = (self.server_ip, self.server_port)
+            sock = socket.socket()
+            sock.settimeout(10)
+            
+            print(f"🔗 Connecting to {self.server_ip}:{self.server_port}...")
+            sock.connect(addr)
+            
+            # Convert data ke JSON
+            data_json = ujson.dumps(data_dict)
+            
+            # Buat HTTP POST request yang proper
+            http_request = (
+                f"POST {endpoint} HTTP/1.1\r\n"
+                f"Host: {self.server_ip}:{self.server_port}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(data_json)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+                f"{data_json}"
+            )
+            
+            # Kirim HTTP request
+            sock.send(http_request.encode())
+            
+            # Terima response
+            response = b""
+            while True:
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                response += chunk
+            
+            response_str = response.decode()
+            
+            # Parse HTTP response
+            if "HTTP/1.1 200" in response_str or "HTTP/1.1 201" in response_str:
+                print(f"✅ Data terkirim")
+                success = True
+            else:
+                print(f"❌ HTTP Error")
+                success = False
+            
+            sock.close()
+            return success
+            
+        except Exception as e:
+            print(f"❌ Gagal kirim data: {e}")
+            return False
+
+class HealthMonitorSystem:
+    def __init__(self):
+        self.wifi = WiFiConnector()
+        self.sensor = HealthSensor()
+        self.http_client = HTTPClient(SERVER_IP, SERVER_PORT)
+        self.button = ButtonHandler()
+        
+        self.groups = {
+            'anak': {'min_hr': 70, 'max_hr': 120, 'min_spo2': 95, 'name': '👶 ANAK', 'color': '🟡'},
+            'dewasa': {'min_hr': 60, 'max_hr': 100, 'min_spo2': 95, 'name': '👨‍💼 DEWASA', 'color': '🟢'}, 
+            'lansia': {'min_hr': 60, 'max_hr': 90, 'min_spo2': 92, 'name': '👵 LANSIA', 'color': '🔵'}
+        }
+        self.group_names = ['anak', 'dewasa', 'lansia']
+        self.current_group_index = 1  # Default: dewasa
+        self.count = 0
+        
+    def get_current_group(self):
+        return self.group_names[self.current_group_index]
+    
+    def change_age_group(self):
+        # Ganti ke kelompok berikutnya
+        self.current_group_index = (self.current_group_index + 1) % len(self.group_names)
+        new_group = self.get_current_group()
+        group_info = self.groups[new_group]
+        
+        print(f"\n🔄 GROUP DIPILIH: {group_info['color']} {group_info['name']}")
+        print(f"   📊 Standar: HR {group_info['min_hr']}-{group_info['max_hr']} BPM, SpO2 ≥ {group_info['min_spo2']}%")
+        
+        # LED feedback - blink sesuai kelompok
+        self.sensor.led.on()
+        time.sleep(0.5)
+        self.sensor.led.off()
+        time.sleep(0.2)
+        self.sensor.led.on()
+        time.sleep(0.5)
+        self.sensor.led.off()
+        
+        return new_group
+    
+    def check_health_status(self, hr, spo2, finger_detected):
+        if not finger_detected:
+            return "TIDAK TERDETEKSI", "⚫"
+        
+        group = self.groups[self.get_current_group()]
+        min_hr = group['min_hr']
+        max_hr = group['max_hr']
+        min_spo2 = group['min_spo2']
+        
+        if min_hr <= hr <= max_hr and spo2 >= min_spo2:
+            return "SEHAT", "🟢"
+        else:
+            return "PERLU PERHATIAN", "🔴"
+    
+    def collect_data(self):
+        self.count += 1
+        hr, spo2, finger_detected = self.sensor.read_sensor()
+        status, symbol = self.check_health_status(hr, spo2, finger_detected)
+        
+        data = {
+            'timestamp': time.time(),
+            'count': self.count,
+            'heart_rate': hr if finger_detected else 0,
+            'spo2': spo2 if finger_detected else 0,
+            'status': status,
+            'age_group': self.get_current_group(),
+            'finger_detected': finger_detected,
+            'device_id': 'ESP32_001'
+        }
+        
+        return data
+    
+    def display_local_info(self, data):
+        group_info = self.groups[data['age_group']]
+        print(f"\n📊 [#{data['count']}] {group_info['color']} {group_info['name']}")
+        if data['finger_detected']:
+            print(f"   ❤️  {data['heart_rate']} BPM | 💨 {data['spo2']}% | {data['status']}")
+            print(f"   📋 Standar: HR {group_info['min_hr']}-{group_info['max_hr']} BPM")
+        else:
+            print(f"   ❌ TIDAK TERDETEKSI | {data['status']}")
+        print(f"   🔘 Tekan tombol untuk ganti kelompok")
+    
+    def run(self):
+        print("🚀 Starting Health Monitoring System...")
+        print("🔘 Tombol di GPIO{} untuk ganti kelompok usia".format(BUTTON_PIN))
+        
+        # Connect WiFi
+        if not self.wifi.connect():
+            print("🔌 Running in offline mode")
+            return
+        
+        print(f"\n🔮 System Ready! Sending data to http://{SERVER_IP}:{SERVER_PORT}...")
+        
+        # Tampilkan kelompok awal
+        current_group = self.get_current_group()
+        group_info = self.groups[current_group]
+        print(f"\n🎯 KELOMPOK AWAL: {group_info['color']} {group_info['name']}")
+        print(f"   📊 Standar: HR {group_info['min_hr']}-{group_info['max_hr']} BPM, SpO2 ≥ {group_info['min_spo2']}%")
+        
+        last_display_time = 0
+        display_interval = 10  # Tampilkan info kelompok setiap 10 detik
+        
+        while True:
+            try:
+                # Cek button press untuk ganti kelompok
+                if self.button.is_pressed():
+                    self.change_age_group()
+                    time.sleep(0.5)  # Debounce
+                
+                # Kumpulkan data
+                data = self.collect_data()
+                
+                # Tampilkan di local
+                self.display_local_info(data)
+                
+                # Kirim ke server jika WiFi connected
+                if self.wifi.connected:
+                    success = self.http_client.send_post_request("/api/data", data)
+                    if not success:
+                        print("💾 Simpan data lokal (fallback)...")
+                
+                # Tampilkan info kelompok secara periodic
+                current_time = time.time()
+                if current_time - last_display_time > display_interval:
+                    group_info = self.groups[self.get_current_group()]
+                    print(f"\n📋 KELOMPAK AKTIF: {group_info['color']} {group_info['name']}")
+                    print(f"   🎯 Standar: HR {group_info['min_hr']}-{group_info['max_hr']} BPM, SpO2 ≥ {group_info['min_spo2']}%")
+                    last_display_time = current_time
+                
+                # LED blink untuk heartbeat
+                self.sensor.led.on()
+                time.sleep(0.1)
+                self.sensor.led.off()
+                
+                time.sleep(2)  # Kirim data setiap 2 detik
+                
+            except Exception as e:
+                print(f"❌ System error: {e}")
+                time.sleep(5)
+            except KeyboardInterrupt:
+                print("\n🛑 Program dihentikan")
+                break
+
+# Jalankan system
+if __name__ == "__main__":
+    system = HealthMonitorSystem()
+    system.run()
+
